@@ -5,6 +5,8 @@ from PIL import Image
 import numpy as np
 from models.networks import define_G
 import glob
+# print(f"Using device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
+# print(f"CUDA initialized: {torch.cuda.is_available()}")
 
 def rescale(image, Rescale=True):
     if not Rescale:
