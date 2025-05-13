@@ -1,21 +1,31 @@
-
 import torch
 import torchvision.transforms as transforms
 from PIL import Image
 import numpy as np
 from models.networks import define_G
 import glob
-# print(f"Using device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
-# print(f"CUDA initialized: {torch.cuda.is_available()}")
+import gc
+import torch.cuda
+import warnings
+
+
+# ignore warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 def rescale(image, Rescale=True):
     if not Rescale:
         return image
     if Rescale:
         width, height = image.size
-        while width > 4000 or height > 4000:
-            image = image.resize((int(width // 2), int(height // 2)), Image.BICUBIC)  # Need to use BICUBIC method.
-            width, height = image.size
+        # Calculate scaling factor to make the larger dimension 1024
+        scale = min(1024 / width, 1024 / height)
+        if scale < 1:  # Only resize if image is larger than 1024 in any dimension
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            image = image.resize((new_width, new_height), Image.BICUBIC)
+        # Handle images smaller than 128 pixels
+        width, height = image.size
         while width < 128 or height < 128:
             image = image.resize((int(width * 2), int(height * 2)), Image.BICUBIC)
             width, height = image.size
@@ -91,18 +101,25 @@ class Model():
             self.G_A_net = define_G(3, 3, 64, "c2pGen", "instance", False, "normal", 0.02, [0])
             self.alias_net = define_G(3, 3, 64, "antialias", "instance", False, "normal", 0.02, [0])
 
-            G_A_state = torch.load("./checkpoints/{}/160_net_G_A.pth".format(self.model_name), map_location=str(self.device))
+            G_A_state = torch.load("./checkpoints/{}/160_net_G_A.pth".format(self.model_name), 
+                                 map_location=str(self.device),
+                                 weights_only=True)
             for p in list(G_A_state.keys()):
                 G_A_state["module."+str(p)] = G_A_state.pop(p)
             self.G_A_net.load_state_dict(G_A_state)
 
-            alias_state = torch.load("./alias_net.pth", map_location=str(self.device))
+            alias_state = torch.load("./alias_net.pth", 
+                                   map_location=str(self.device),
+                                   weights_only=True)
             for p in list(alias_state.keys()):
                 alias_state["module."+str(p)] = alias_state.pop(p)
             self.alias_net.load_state_dict(alias_state)
 
             code = torch.tensor(MLP_code, device=self.device).reshape((1, 256, 1, 1))
             self.cell_size_code = self.G_A_net.module.MLP(code)
+            
+            self.G_A_net.eval()
+            self.alias_net.eval()
 
     def pixelize(self, in_img, out_img, cell_size):
         with torch.no_grad():
