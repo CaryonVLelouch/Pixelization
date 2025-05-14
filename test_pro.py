@@ -18,13 +18,14 @@ def rescale(image, Rescale=True):
         return image
     if Rescale:
         width, height = image.size
-        # Calculate scaling factor to make the larger dimension 1024
-        scale = min(1024 / width, 1024 / height)
-        if scale < 1:  # Only resize if image is larger than 1024 in any dimension
+        threshold = 2048
+        # calculate scaling factor to make the larger dimension threshold
+        scale = min(threshold / width, threshold / height)
+        if scale < 1:  # resize if image is larger than threshold in any dimension
             new_width = int(width * scale)
             new_height = int(height * scale)
             image = image.resize((new_width, new_height), Image.BICUBIC)
-        # Handle images smaller than 128 pixels
+        #handle images smaller than 128 pixels
         width, height = image.size
         while width < 128 or height < 128:
             image = image.resize((int(width * 2), int(height * 2)), Image.BICUBIC)
