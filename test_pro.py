@@ -7,6 +7,9 @@ import glob
 import gc
 import torch.cuda
 import warnings
+import cv2
+import os
+from pathlib import Path
 
 
 # ignore warnings
@@ -97,75 +100,110 @@ class Model():
         self.ref_t = None
         self.cell_size_code = None
         self.model_name = model_name
+        # Load anime model from torch hub
+        self.anime_model = torch.hub.load("bryandlee/animegan2-pytorch:main", "generator", pretrained="face_paint_512_v2").to(device)
+        self.anime_model.eval()
+        
     def load(self):
         with torch.no_grad():
             self.G_A_net = define_G(3, 3, 64, "c2pGen", "instance", False, "normal", 0.02, [0])
             self.alias_net = define_G(3, 3, 64, "antialias", "instance", False, "normal", 0.02, [0])
-
             G_A_state = torch.load("./checkpoints/{}/160_net_G_A.pth".format(self.model_name), 
                                  map_location=str(self.device),
                                  weights_only=True)
             for p in list(G_A_state.keys()):
                 G_A_state["module."+str(p)] = G_A_state.pop(p)
             self.G_A_net.load_state_dict(G_A_state)
-
             alias_state = torch.load("./alias_net.pth", 
                                    map_location=str(self.device),
                                    weights_only=True)
             for p in list(alias_state.keys()):
                 alias_state["module."+str(p)] = alias_state.pop(p)
             self.alias_net.load_state_dict(alias_state)
-
             code = torch.tensor(MLP_code, device=self.device).reshape((1, 256, 1, 1))
             self.cell_size_code = self.G_A_net.module.MLP(code)
-            
             self.G_A_net.eval()
             self.alias_net.eval()
+
+    def animeize_image(self, image_path):
+        """Convert a real image to anime style using torch hub model"""
+        # Read and convert image
+        img = Image.open(image_path).convert('RGB')
+        
+        # Transform image to tensor
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+        img_tensor = transform(img).unsqueeze(0).to(self.device)
+        
+        # Generate anime style
+        with torch.no_grad():
+            output = self.anime_model(img_tensor)
+        
+        # Convert back to image
+        output = output.squeeze(0).cpu()
+        output = (output + 1) / 2.0 * 255.0
+        output = output.clamp(0, 255).to(torch.uint8)
+        output = output.permute(1, 2, 0).numpy()
+        output_img = Image.fromarray(output)
+        
+        # Save intermediate result
+        base, ext = os.path.splitext(image_path)
+        output_path = f"{base}_anime{ext}"
+        output_img.save(output_path)
+        return output_path
 
     def pixelize(self, in_img, out_img, cell_size):
         with torch.no_grad():
             in_img = Image.open(in_img).convert('RGB')
-            in_img = rescale(in_img)
             width, height = in_img.size
-            cell_size = cell_size
             best_cell_size = 4
-            in_img = in_img.resize(((width // cell_size) * best_cell_size, (height // cell_size) * best_cell_size),
-                               Image.BICUBIC)
-            in_t = process(in_img).to(self.device)
-
-            feature = self.G_A_net.module.RGBEnc(in_t)
+            
+            # Process the entire image at once
+            trans = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+            img_tensor = trans(in_img).unsqueeze(0).to(self.device)
+            
+            # Generate pixelized image
+            feature = self.G_A_net.module.RGBEnc(img_tensor)
             images = self.G_A_net.module.RGBDec(feature, self.cell_size_code)
             out_t = self.alias_net(images)
-            save(out_t, out_img, cell_size, best_cell_size)
+            
+            # Convert tensor to image
+            out_img_tensor = out_t[0].cpu().float()
+            out_img_tensor = (out_img_tensor + 1) / 2.0 * 255.0
+            out_img_tensor = out_img_tensor.clamp(0, 255).to(torch.uint8)
+            out_img_tensor = out_img_tensor.permute(1, 2, 0).numpy()
+            merged_img = Image.fromarray(out_img_tensor)
+            
+            # Resize to final dimensions
+            merged_img = merged_img.resize(((width // cell_size) * best_cell_size, 
+                                         (height // cell_size) * best_cell_size), 
+                                         Image.NEAREST)
+            merged_img = merged_img.resize((width, height), Image.NEAREST)
+            merged_img.save(out_img)
 
+def load_binary_classifier():
+    """Load the binary classifier model"""
+    model = torch.load('binaryClassifier/realunreal_classifier.pt')
+    return model
 
-
-def process(img):
-    ow,oh = img.size
-
-    nw = int(round(ow / 4) * 4)
-    nh = int(round(oh / 4) * 4)
-
-    left = (ow - nw)//2
-    top = (oh - nh)//2
-    right = left + nw
-    bottom = top + nh
-
-    img = img.crop((left, top, right, bottom))
-
-    trans = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-
-    return trans(img)[None, :, :, :]
-
-def save(tensor, file, cell_size, best_cell_size=4):
-    img = tensor.data[0].cpu().float().numpy()
-    img = (np.transpose(img, (1, 2, 0)) + 1) / 2.0 * 255.0
-    img = img.astype(np.uint8)
-    img = Image.fromarray(img)
-    img = img.resize((img.size[0]//best_cell_size, img.size[1]//best_cell_size), Image.NEAREST)
-    img = img.resize((img.size[0]*cell_size, img.size[1]*cell_size), Image.NEAREST)
-    img.save(file)
-
+def is_real_image(image_path, classifier):
+    """Determine if an image is real using the binary classifier"""
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    img = Image.open(image_path).convert('RGB')
+    img_tensor = transform(img).unsqueeze(0)
+    
+    with torch.no_grad():
+        output = classifier['model'](img_tensor)
+        _, predicted = torch.max(output, 1)
+        
+    return predicted.item() == 0  # 0 for real, 1 for unreal
 
 def pixelize_cli():
     import argparse
@@ -185,6 +223,13 @@ def pixelize_cli():
 
     if not os.path.exists("alias_net.pth"):
         print("missing models")
+
+    # Load all required models
+    print("Loading models...")
+    binary_classifier = load_binary_classifier()
+    pixel_model = Model(model_name, device="cpu" if use_cpu else "cuda")
+    pixel_model.load()
+    print("All models loaded successfully")
 
     pairs = []
 
@@ -209,12 +254,30 @@ def pixelize_cli():
                 out_path = os.path.join(out_path, file)
         pairs = [(in_path, out_path)]
 
-    m = Model(model_name, device = "cpu" if use_cpu else "cuda")
-    m.load()
-
     for in_file, out_file in pairs:
-        print("PROCESSING", in_file, "TO", out_file)
-        m.pixelize(in_file, out_file, cell_size)
+        print(f"Processing {in_file}...")
+        
+        # Step 1: Check if image is real
+        is_real = is_real_image(in_file, binary_classifier)
+        print(f"Image is {'real' if is_real else 'unreal'}")
+        
+        # Step 2: For real images, apply anime generation first
+        if is_real:
+            print("Applying anime generation...")
+            anime_file = pixel_model.animeize_image(in_file)
+            pixelize_input = anime_file
+        else:
+            pixelize_input = in_file
+        
+        # Step 3: Apply pixelization
+        print("Applying pixelization...")
+        pixel_model.pixelize(pixelize_input, out_file, cell_size)
+        
+        # Clean up intermediate files
+        if is_real and os.path.exists(anime_file):
+            os.remove(anime_file)
+        
+        print(f"Completed processing {in_file} -> {out_file}")
 
 if __name__ == "__main__":
     pixelize_cli()
